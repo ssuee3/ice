@@ -12,7 +12,7 @@ SCREENSHOT_PATH = "icehost_debug_screenshot.png"
 
 
 def send_tg_notification(message, photo_path=None):
-    """发送结果和截图至 Telegram"""
+    """发送结果和截图至 Telegram。"""
     token = os.getenv("TG_BOT_TOKEN")
     chat_id = os.getenv("TG_CHAT_ID")
     if not token or not chat_id:
@@ -26,8 +26,11 @@ def send_tg_notification(message, photo_path=None):
             "text": message,
             "parse_mode": "HTML",
         }
-        requests.post(url, json=payload, timeout=20)
-        print("TG 状态通知发送成功。")
+        resp = requests.post(url, json=payload, timeout=20)
+        if resp.ok:
+            print("TG 状态通知发送成功。")
+        else:
+            print(f"TG 状态通知发送失败: HTTP {resp.status_code} {resp.text[:500]}")
     except Exception as e:
         print(f"发送 TG 消息异常: {e}")
 
@@ -37,8 +40,11 @@ def send_tg_notification(message, photo_path=None):
             with open(photo_path, "rb") as f:
                 files = {"photo": f}
                 data = {"chat_id": chat_id, "caption": "IceHost 实时画面"}
-                requests.post(url, data=data, files=files, timeout=40)
-            print("TG 截图发送成功。")
+                resp = requests.post(url, data=data, files=files, timeout=40)
+            if resp.ok:
+                print("TG 截图发送成功。")
+            else:
+                print(f"TG 截图发送失败: HTTP {resp.status_code} {resp.text[:500]}")
         except Exception as e:
             print(f"发送 TG 截图异常: {e}")
 
@@ -126,17 +132,106 @@ def dump_clickable_texts(sb):
         print(f"打印可点击元素列表失败: {e}")
 
 
+
+def find_renew_button_by_js(sb):
+    """用浏览器 JS 按 innerText 寻找续期按钮。这个比 XPath 更适合 React/Styled Components 页面。"""
+    script = """
+    const keywords = [
+        'add 6',
+        'add 6 hours',
+        'add 6 hours validity',
+        '6 hours validity',
+        'validity',
+        'dodaj 6',
+        'przedluz',
+        'przedłuż',
+        'ważności',
+        'waznosci'
+    ];
+
+    function normalizeText(value) {
+        return String(value || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function isVisible(el) {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== 'none'
+            && style.visibility !== 'hidden'
+            && Number(style.opacity || 1) !== 0
+            && rect.width > 0
+            && rect.height > 0;
+    }
+
+    const candidates = Array.from(document.querySelectorAll(
+        'button, a, input[type="button"], input[type="submit"], [role="button"]'
+    ));
+
+    for (const el of candidates) {
+        const disabled = !!el.disabled
+            || el.getAttribute('disabled') !== null
+            || el.getAttribute('aria-disabled') === 'true'
+            || String(el.className || '').toLowerCase().includes('disabled');
+        if (disabled || !isVisible(el)) continue;
+
+        const rawText = el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '';
+        const text = normalizeText(rawText);
+        if (!text) continue;
+
+        if (keywords.some(k => text.includes(normalizeText(k)))) {
+            return el;
+        }
+    }
+    return null;
+    """
+    return sb.execute_script(script)
+
+
+def wait_for_renew_button_by_js(sb, timeout=30):
+    deadline = time.time() + timeout
+    last_seen = None
+    while time.time() < deadline:
+        el = find_renew_button_by_js(sb)
+        if el:
+            return el
+        try:
+            last_seen = sb.execute_script("""
+                return Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'))
+                    .map(el => (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim())
+                    .filter(Boolean)
+                    .slice(0, 80);
+            """)
+        except Exception:
+            pass
+        sb.sleep(1)
+    raise Exception(f"JS 等待 {timeout} 秒后仍未找到续期按钮。最近检测到的可点击文字: {last_seen}")
+
 def click_renew_button(sb, selector):
-    """滚动到续期按钮并点击；普通点击失败时使用 JS 点击兜底。"""
-    sb.wait_for_element_visible(selector, timeout=25)
-    sb.scroll_to(selector)
-    sb.sleep(0.5)
+    """滚动到续期按钮并点击。优先使用 JS 按 innerText 找按钮，XPath 仅作为兜底。"""
     try:
-        sb.click(selector)
-    except Exception as e:
-        print(f"普通点击续期按钮失败，尝试 JS 点击兜底: {e}")
+        element = wait_for_renew_button_by_js(sb, timeout=30)
+        print("已通过 JS innerText 找到续期按钮。")
+    except Exception as js_error:
+        print(f"JS 查找续期按钮失败，尝试 XPath 兜底: {js_error}")
+        sb.wait_for_element_visible(selector, timeout=15)
         element = sb.find_element(selector)
+        print("已通过 XPath 兜底找到续期按钮。")
+
+    sb.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
+    sb.sleep(0.8)
+
+    try:
+        element.click()
+        print("已使用 Selenium WebElement.click() 点击续期按钮。")
+    except Exception as e:
+        print(f"普通点击续期按钮失败，尝试 JS click 兜底: {e}")
         sb.execute_script("arguments[0].click();", element)
+        print("已使用 JS click 点击续期按钮。")
 
 
 def run():
@@ -227,7 +322,7 @@ def run():
         renew_btn_selector = build_renew_button_xpath()
 
         try:
-            print("正在等待续期按钮加载（兼容 ADD 6 HOURS VALIDITY / dodaj 6 等文案）...")
+            print("正在等待续期按钮加载（优先使用 JS innerText 识别 ADD 6 HOURS VALIDITY / dodaj 6 等文案）...")
             click_renew_button(sb, renew_btn_selector)
             print("未检测到限制提示，找到续期按钮，并已点击。")
 
@@ -270,6 +365,11 @@ def run():
             sb.save_screenshot(SCREENSHOT_PATH)
             print(f"未找到匹配当前语言文案的续期按钮，或按钮不可点击: {e}")
             dump_clickable_texts(sb)
+            msg = (
+                "❌ <b>IceHost 续期脚本异常</b>\n"
+                "页面里可能能看到按钮，但自动点击失败。请查看 GitHub Actions 日志和截图。"
+            )
+            send_tg_notification(msg, SCREENSHOT_PATH)
 
 
 if __name__ == "__main__":

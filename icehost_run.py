@@ -8,6 +8,8 @@ from seleniumbase import SB
 
 SERVER_URL = os.getenv("ICEHOST_SERVER_URL")
 ICEHOST_COOKIES = os.getenv("ICEHOST_COOKIES")
+SCREENSHOT_PATH = "icehost_debug_screenshot.png"
+
 
 def send_tg_notification(message, photo_path=None):
     """发送结果和截图至 Telegram"""
@@ -22,9 +24,9 @@ def send_tg_notification(message, photo_path=None):
         payload = {
             "chat_id": chat_id,
             "text": message,
-            "parse_mode": "HTML"
+            "parse_mode": "HTML",
         }
-        requests.post(url, json=payload)
+        requests.post(url, json=payload, timeout=20)
         print("TG 状态通知发送成功。")
     except Exception as e:
         print(f"发送 TG 消息异常: {e}")
@@ -35,10 +37,107 @@ def send_tg_notification(message, photo_path=None):
             with open(photo_path, "rb") as f:
                 files = {"photo": f}
                 data = {"chat_id": chat_id, "caption": "IceHost 实时画面"}
-                requests.post(url, data=data, files=files)
+                requests.post(url, data=data, files=files, timeout=40)
             print("TG 截图发送成功。")
         except Exception as e:
             print(f"发送 TG 截图异常: {e}")
+
+
+def xpath_literal(value):
+    """把任意字符串安全转成 XPath 字符串字面量。"""
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    return "concat(" + ", \"'\", ".join(f"'{part}'" for part in value.split("'")) + ")"
+
+
+def build_renew_button_xpath():
+    """
+    同时兼容 IceHost 面板的英文和波兰语续期按钮。
+
+    原脚本只匹配 dodaj 6，但当前截图里的按钮是 ADD 6 HOURS VALIDITY，
+    所以 GitHub Actions 会误判找不到按钮。
+    """
+    upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZĄĆĘŁŃÓŚŹŻ"
+    lower = "abcdefghijklmnopqrstuvwxyząćęłńóśźż"
+
+    keywords = [
+        # English UI
+        "add 6",
+        "add 6 hours",
+        "add 6 hours validity",
+        "6 hours validity",
+        "validity",
+        # Polish UI / fallback
+        "dodaj 6",
+        "przedluz",
+        "przedłuż",
+        "ważności",
+        "waznosci",
+    ]
+
+    normalized_text = (
+        f"translate(normalize-space(.), {xpath_literal(upper)}, {xpath_literal(lower)})"
+    )
+    keyword_conditions = " or ".join(
+        f"contains({normalized_text}, {xpath_literal(keyword)})" for keyword in keywords
+    )
+
+    # 不再使用 not(*)，因为真实按钮可能包含 span/i 等子元素。
+    # 同时允许 button、a、input，以及 role=button 的元素。
+    return f"""
+    //*[
+        (
+            self::button
+            or self::a
+            or self::input[@type='button' or @type='submit']
+            or @role='button'
+        )
+        and not(@disabled)
+        and not(contains(@class, 'disabled'))
+        and ({keyword_conditions})
+    ]
+    """
+
+
+def dump_clickable_texts(sb):
+    """找不到续期按钮时打印页面里的按钮/链接文字，方便排查面板文案变化。"""
+    try:
+        script = """
+        const els = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'));
+        return els.map((el, idx) => ({
+            idx,
+            tag: el.tagName,
+            text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim(),
+            cls: el.className || '',
+            disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'
+        })).filter(x => x.text);
+        """
+        items = sb.execute_script(script)
+        print("页面中检测到的可点击元素文字如下：")
+        for item in items:
+            print(
+                f"[{item.get('idx')}] {item.get('tag')} "
+                f"disabled={item.get('disabled')} "
+                f"text={item.get('text')!r} class={item.get('cls')!r}"
+            )
+    except Exception as e:
+        print(f"打印可点击元素列表失败: {e}")
+
+
+def click_renew_button(sb, selector):
+    """滚动到续期按钮并点击；普通点击失败时使用 JS 点击兜底。"""
+    sb.wait_for_element_visible(selector, timeout=25)
+    sb.scroll_to(selector)
+    sb.sleep(0.5)
+    try:
+        sb.click(selector)
+    except Exception as e:
+        print(f"普通点击续期按钮失败，尝试 JS 点击兜底: {e}")
+        element = sb.find_element(selector)
+        sb.execute_script("arguments[0].click();", element)
+
 
 def run():
     if not SERVER_URL:
@@ -65,23 +164,23 @@ def run():
                 for c in cookies_to_add:
                     raw_value = c["value"]
                     decoded_value = urllib.parse.unquote(raw_value)
-                    
+
                     # 转换格式为 Selenium 格式
                     cookie_dict = {
                         "name": c["name"],
                         "value": decoded_value,
                         "domain": c["domain"],
                         "path": c.get("path", "/"),
-                        "secure": c.get("secure", True)
+                        "secure": c.get("secure", True),
                     }
                     if "sameSite" in c:
                         ss = str(c["sameSite"]).lower()
                         if ss in ["lax", "strict", "none"]:
                             cookie_dict["sameSite"] = ss.capitalize()
-                    
+
                     sb.add_cookie(cookie_dict)
                 print("Cookie 成功注入！")
-                
+
                 # 重新刷新加载，应用 Cookie
                 sb.refresh()
                 sb.sleep(5)
@@ -89,13 +188,13 @@ def run():
                 print(f"注入 Cookie 过程中发生异常，跳过: {e}")
 
         # 3. 核心过盾：自动寻找并执行系统级物理点击过 Cloudflare Turnstile 验证盾
-        sb.save_screenshot("icehost_debug_screenshot.png")
+        sb.save_screenshot(SCREENSHOT_PATH)
         try:
             print("正在检测并调用系统级 PyAutoGUI 驱动，物理点击 Cloudflare 人机验证码...")
             # 在虚拟桌面上定位验证框并模拟发送系统硬件级点击事件
             sb.uc_gui_click_captcha()
-            sb.sleep(10) # 给予 10 秒跳转缓冲
-            sb.save_screenshot("icehost_debug_screenshot.png")
+            sb.sleep(10)  # 给予 10 秒跳转缓冲
+            sb.save_screenshot(SCREENSHOT_PATH)
         except Exception as e:
             print(f"验证盾已被跳过或点击执行完毕: {e}")
 
@@ -105,60 +204,73 @@ def run():
         if "login" in current_url or sb.is_element_visible("input[type='email']"):
             msg = "❌ <b>IceHost 登录失效！</b>\n请在浏览器重新提取并更新 ICEHOST_COOKIES。"
             print(msg)
-            send_tg_notification(msg, "icehost_debug_screenshot.png")
+            send_tg_notification(msg, SCREENSHOT_PATH)
             return
 
-        # 5. 判定波兰语红框限制
+        # 5. 判定未到续期时间的限制提示。保留波兰语，并增加英文兜底。
         page_source = sb.get_page_source()
-        keywords = ["Nie możesz przedłużyć", "niedawno to zrobiłeś", "kolejne 6 godziny"]
-        is_limited = any(kw in page_source for kw in keywords)
+        limit_keywords = [
+            "Nie możesz przedłużyć",
+            "niedawno to zrobiłeś",
+            "kolejne 6 godziny",
+            "cannot extend",
+            "recently extended",
+            "try again later",
+        ]
+        is_limited = any(kw.lower() in page_source.lower() for kw in limit_keywords)
 
         if is_limited:
-            print("检测到红框限制提示：说明未到可续期时间。结束本次运行（不发送 Telegram 提醒）。")
+            print("检测到限制提示：说明未到可续期时间。结束本次运行（不发送 Telegram 提醒）。")
             return
 
         # 6. 安全寻找并点击续期按钮
-        renew_btn_selector = "//*[not(*) and contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'dodaj 6')]"
-        
+        renew_btn_selector = build_renew_button_xpath()
+
         try:
-            print("正在等待续期按钮加载...")
-            sb.wait_for_element_visible(renew_btn_selector, timeout=15)
-            print("未检测到限制提示，找到续期按钮，正在点击...")
-            sb.click(renew_btn_selector)
-            
-            # ⚡ 核心改进：点击后，在不刷新页面的前提下，先等待 5 秒让可能弹出的红框提示充分渲染
+            print("正在等待续期按钮加载（兼容 ADD 6 HOURS VALIDITY / dodaj 6 等文案）...")
+            click_renew_button(sb, renew_btn_selector)
+            print("未检测到限制提示，找到续期按钮，并已点击。")
+
+            # 点击后，在不刷新页面的前提下，先等待 5 秒让可能弹出的红框提示充分渲染
             sb.sleep(5)
-            sb.save_screenshot("icehost_debug_screenshot.png")
-            
-            # 立即读取当前最真实的页面源码（此时若有报错红条，必定还挂在屏幕上）
+            sb.save_screenshot(SCREENSHOT_PATH)
+
+            # 立即读取当前最真实的页面源码（此时若有报错红条，通常还挂在屏幕上）
             current_source = sb.get_page_source()
-            is_failed_due_to_limit = any(kw in current_source for kw in keywords)
-            
+            is_failed_due_to_limit = any(
+                kw.lower() in current_source.lower() for kw in limit_keywords
+            )
+
             if is_failed_due_to_limit:
                 # 如果点击后页面上弹出了红框，说明“未到可续期时间”（续期未成功）
-                # 此时我们精准拦截：安静退出，绝不发送 Telegram 提醒打扰你！
+                # 此时精准拦截：安静退出，不发送 Telegram 提醒。
                 print("点击后，页面立刻弹出了限制提示：说明未到可续期时间（续期未成功）。结束本次运行（不发送 Telegram 提醒）。")
                 return
-            
-            # 如果没有弹出红框，说明时间确实被成功延长了，这时才执行刷新验证结果
+
+            # 如果没有弹出红框，说明时间大概率被成功延长了，这时再刷新验证结果
             print("点击后未检测到报错红条，正在刷新页面确认续期结果...")
             sb.refresh()
             sb.sleep(5)
-            sb.save_screenshot("icehost_debug_screenshot.png")
-            
+            sb.save_screenshot(SCREENSHOT_PATH)
+
             updated_source = sb.get_page_source()
-            is_now_limited = any(kw in updated_source for kw in keywords)
-            
+            is_now_limited = any(
+                kw.lower() in updated_source.lower() for kw in limit_keywords
+            )
+
             if is_now_limited:
                 msg = "⚡ <b>IceHost 服务器续期成功！</b>\n服务器已真正成功延长 6 小时有效期。"
                 print(msg)
-                send_tg_notification(msg, "icehost_debug_screenshot.png")
+                send_tg_notification(msg, SCREENSHOT_PATH)
             else:
                 msg = "ℹ️ <b>IceHost 续期指令已发送</b>\n按钮已点击，请检查下方截图确认是否成功。"
                 print(msg)
-                send_tg_notification(msg, "icehost_debug_screenshot.png")
+                send_tg_notification(msg, SCREENSHOT_PATH)
         except Exception as e:
-            print(f"未在页面中找到可用的蓝色续期按钮（可能已被续满，或按钮标签发生变动）: {e}")
+            sb.save_screenshot(SCREENSHOT_PATH)
+            print(f"未找到匹配当前语言文案的续期按钮，或按钮不可点击: {e}")
+            dump_clickable_texts(sb)
+
 
 if __name__ == "__main__":
     run()

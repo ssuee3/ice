@@ -3,7 +3,7 @@ name: IceHost Hourly KeepAlive
 on:
   workflow_dispatch: # 保留手动或外部 API 触发功能
   schedule:
-    - cron: '49 */4 * * *' # 添加定时任务：每 5 小时的第 0 分钟运行一次
+    - cron: '42 */4 * * *' # 添加定时任务：每 5 小时的第 0 分钟运行一次
 jobs:
   check-and-start:
     runs-on: ubuntu-latest
